@@ -1,185 +1,252 @@
-// server.js ---------------------------------------------------------
-const express  = require('express');
-const multer   = require('multer');
-const sharp    = require('sharp');
-const path     = require('path');
-const fs       = require('fs');
-const fetch    = require('node-fetch');      // npm i node-fetch@2
-const FormData = require('form-data');       // npm i form-data
-const { Pool } = require('pg');              // npm i pg
-const bcrypt   = require('bcrypt');          // npm i bcrypt
-const jwt      = require('jsonwebtoken');    // npm i jsonwebtoken
+const express = require("express");
+const multer = require("multer");
+const path = require("path");
+const fs = require("fs");
+const fetch = require("node-fetch");
+const FormData = require("form-data");
+const { Pool } = require("pg");
+const bcrypt = require("bcrypt");
+const jwt = require("jsonwebtoken");
+require("dotenv").config();
 
-console.log('❯ DATABASE_URL       =', process.env.DATABASE_URL);
-
-// ── CONSTANTS & CONFIG ────────────────────────────────────────────
 const SALT_ROUNDS = 10;
-const JWT_SECRET  = process.env.JWT_SECRET || 'change_this_secret';
+const PORT = Number(process.env.PORT || 3000);
+const JWT_SECRET = process.env.JWT_SECRET;
+const PYTHON_API_URL = process.env.PYTHON_API_URL || "http://localhost:5000";
+const DATABASE_URL = process.env.DATABASE_URL;
+
+if (!DATABASE_URL) {
+  throw new Error("Missing required environment variable: DATABASE_URL");
+}
+
+if (!JWT_SECRET) {
+  throw new Error("Missing required environment variable: JWT_SECRET");
+}
 
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
+  connectionString: DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
 
-const FLASK_URL = process.env.PYTHON_API_URL || "http://localhost:5000";
-const PORT         = process.env.PORT || 3000;
-const UPLOADS_DIR  = path.join(__dirname, 'uploads');
-
-// Ensure uploads folder exists
+const UPLOADS_DIR = path.join(__dirname, "uploads");
 fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 
-// ── APP SETUP ─────────────────────────────────────────────────────
 const app = express();
-app.use('/uploads', express.static(UPLOADS_DIR));
+
+app.use("/uploads", express.static(UPLOADS_DIR));
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-// ── MULTER CONFIG ────────────────────────────────────────────────
 const storage = multer.diskStorage({
   destination: UPLOADS_DIR,
-  filename:  (req, file, cb) => cb(null, Date.now() + '-' + file.originalname)
+  filename: (req, file, cb) => cb(null, `${Date.now()}-${file.originalname}`)
 });
+
 const upload = multer({ storage });
 
-// ── ROUTES ───────────────────────────────────────────────────────
-
-// ------------------------------------------------------------------
-// AUTHENTICATION ROUTES USING TABLE public.utilisateur
-// ------------------------------------------------------------------
+app.get("/health", async (req, res) => {
+  try {
+    await pool.query("SELECT 1");
+    res.json({
+      success: true,
+      service: "binwatch-api",
+      status: "ok",
+      pythonApiUrl: PYTHON_API_URL
+    });
+  } catch (error) {
+    console.error("[/health] DB error:", error);
+    res.status(500).json({
+      success: false,
+      service: "binwatch-api",
+      status: "error",
+      error: "Database connection failed"
+    });
+  }
+});
 
 /*
-Table public.utilisateur structure (expected)
--------------------------------------------------
- id             SERIAL PRIMARY KEY
- prenom         VARCHAR(100)   NOT NULL
- nom            VARCHAR(100)   NOT NULL
- email          VARCHAR(255)   UNIQUE NOT NULL
- ville          VARCHAR(100)
- mot_de_passe   TEXT           NOT NULL   -- stores *hashed* password
- date_creation  TIMESTAMP      DEFAULT CURRENT_TIMESTAMP
+Expected tables:
+- public.utilisateur
+- public.image_features
+- public.image_history
 */
 
-// POST /register – create user account (ville → "confidentiel")
-app.post('/register', async (req, res) => {
-  // Accept ville from body; fallback to "confidentiel" if absent/empty
+app.post("/register", async (req, res) => {
   let { prenom, nom, email, ville, password } = req.body;
-  ville = (ville || '').trim() || 'confidentiel';
+  ville = (ville || "").trim() || "confidentiel";
 
-  // Basic validation (ville may be empty)
   if (!prenom || !nom || !email || !password) {
-    return res.status(400).json({ success: false, error: 'Champs requis manquants' });
+    return res.status(400).json({
+      success: false,
+      error: "Champs requis manquants"
+    });
   }
 
   try {
-    // Check if email already exists
-    const exists = await pool.query('SELECT 1 FROM public.utilisateur WHERE email = $1', [email]);
+    const exists = await pool.query(
+      "SELECT 1 FROM public.utilisateur WHERE email = $1",
+      [email]
+    );
+
     if (exists.rowCount > 0) {
-      return res.status(409).json({ success: false, error: 'Email déjà utilisé' });
+      return res.status(409).json({
+        success: false,
+        error: "Email déjà utilisé"
+      });
     }
 
-    // Hash password
     const hash = await bcrypt.hash(password, SALT_ROUNDS);
 
-    // Insert new user
     const insertSQL = `
       INSERT INTO public.utilisateur (prenom, nom, email, ville, mot_de_passe)
       VALUES ($1, $2, $3, $4, $5)
       RETURNING id
     `;
+
     const { rows } = await pool.query(insertSQL, [prenom, nom, email, ville, hash]);
     const userId = rows[0].id;
 
-    // Issue JWT token
-    const token = jwt.sign({ userId, email, prenom, nom }, JWT_SECRET, { expiresIn: '7d' });
-    res.status(201).json({ success: true, token, user: { id: userId, prenom, nom, email, ville } });
-  } catch (err) {
-    console.error('[/register] error:', err);
-    res.status(500).json({ success: false, error: "Échec de l'inscription" });
+    const token = jwt.sign({ userId, email, prenom, nom }, JWT_SECRET, {
+      expiresIn: "7d"
+    });
+
+    return res.status(201).json({
+      success: true,
+      token,
+      user: { id: userId, prenom, nom, email, ville }
+    });
+  } catch (error) {
+    console.error("[/register] error:", error);
+    return res.status(500).json({
+      success: false,
+      error: "Échec de l'inscription"
+    });
   }
 });
 
-// POST /login – authenticate user
-app.post('/login', async (req, res) => {
+app.post("/login", async (req, res) => {
   const { email, password } = req.body;
 
   if (!email || !password) {
-    return res.status(400).json({ success: false, error: 'Email et mot de passe requis' });
+    return res.status(400).json({
+      success: false,
+      error: "Email et mot de passe requis"
+    });
   }
 
   try {
     const userRes = await pool.query(
-      'SELECT id, prenom, nom, mot_de_passe, ville FROM public.utilisateur WHERE email = $1',
+      "SELECT id, prenom, nom, mot_de_passe, ville FROM public.utilisateur WHERE email = $1",
       [email]
     );
 
     if (userRes.rowCount === 0) {
-      return res.status(401).json({ success: false, error: 'Identifiants invalides' });
+      return res.status(401).json({
+        success: false,
+        error: "Identifiants invalides"
+      });
     }
 
     const { id, prenom, nom, mot_de_passe: hash, ville } = userRes.rows[0];
     const match = await bcrypt.compare(password, hash);
 
     if (!match) {
-      return res.status(401).json({ success: false, error: 'Identifiants invalides' });
+      return res.status(401).json({
+        success: false,
+        error: "Identifiants invalides"
+      });
     }
 
-    const token = jwt.sign({ userId: id, email, prenom, nom }, JWT_SECRET, { expiresIn: '7d' });
-    res.json({ success: true, token, user: { id, prenom, nom, email, ville } });
-  } catch (err) {
-    console.error('[/login] error:', err);
-    res.status(500).json({ success: false, error: 'Échec de connexion' });
+    const token = jwt.sign({ userId: id, email, prenom, nom }, JWT_SECRET, {
+      expiresIn: "7d"
+    });
+
+    return res.json({
+      success: true,
+      token,
+      user: { id, prenom, nom, email, ville }
+    });
+  } catch (error) {
+    console.error("[/login] error:", error);
+    return res.status(500).json({
+      success: false,
+      error: "Échec de connexion"
+    });
   }
 });
 
-// ------------------------------------------------------------------
-// IMAGE ROUTES (unchanged)
-// ------------------------------------------------------------------
+function auth(req, res, next) {
+  const authHeader = req.headers.authorization || "";
+  const token = authHeader.split(" ")[1];
 
-// POST /upload → classify image, store metadata, history
-app.post('/upload', upload.single('image'), async (req, res) => {
-  if (!req.file) {
-    return res.status(400).json({ success: false, error: 'Aucun fichier téléchargé' });
+  if (!token) {
+    return res.status(401).json({
+      success: false,
+      error: "Token manquant"
+    });
   }
 
-  const localPath  = `/uploads/${req.file.filename}`;
-  const imagePath  = path.join(UPLOADS_DIR, req.file.filename);
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    req.user = payload;
+    return next();
+  } catch (error) {
+    return res.status(401).json({
+      success: false,
+      error: "Token invalide"
+    });
+  }
+}
+
+app.post("/upload", upload.single("image"), async (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({
+      success: false,
+      error: "Aucun fichier téléchargé"
+    });
+  }
+
+  const localPath = `/uploads/${req.file.filename}`;
+  const imagePath = path.join(UPLOADS_DIR, req.file.filename);
   const { annotation, location, date } = req.body;
 
-  let pythonLabel, pyFeat;
+  let pythonLabel;
+  let pyFeat;
 
-  // Call Flask for classification
   try {
     const form = new FormData();
-    form.append('image', fs.createReadStream(imagePath));
+    form.append("image", fs.createReadStream(imagePath));
 
-    const flaskResp = await fetch(`${FLASK_URL}/classify`, {
-      method:  'POST',
-      body:    form,
+    const flaskResp = await fetch(`${PYTHON_API_URL}/classify`, {
+      method: "POST",
+      body: form,
       headers: form.getHeaders(),
       timeout: 30000
     });
 
     if (!flaskResp.ok) {
-      throw new Error(`Flask responded ${flaskResp.status}`);
+      throw new Error(`Python API responded ${flaskResp.status}`);
     }
 
     const json = await flaskResp.json();
     pythonLabel = json.label;
-    pyFeat      = json.features;
-  } catch (err) {
-    console.error('[/upload] classification error:', err);
-    return res.status(502).json({ success: false, error: "Classification d'image impossible" });
+    pyFeat = json.features;
+  } catch (error) {
+    console.error("[/upload] classification error:", error);
+    return res.status(502).json({
+      success: false,
+      error: "Classification d'image impossible"
+    });
   }
 
-  // Insert into DB
   try {
-    // 1. image_features
     const insertImageSQL = `
       INSERT INTO public.image_features
         (path, file_size_kb, width, height, mean_r, mean_g, mean_b)
       VALUES ($1, $2, $3, $4, $5, $6, $7)
       RETURNING id
     `;
+
     const imageParams = [
       localPath,
       Math.round(pyFeat.size_kb),
@@ -189,38 +256,37 @@ app.post('/upload', upload.single('image'), async (req, res) => {
       pyFeat.avg_g,
       pyFeat.avg_b
     ];
-    const imageResult = await pool.query(insertImageSQL, imageParams);
-    const imageId = imageResult.rows[0]?.id;
 
-    // 2. image_history
+    const imageResult = await pool.query(insertImageSQL, imageParams);
+    const imageId = imageResult.rows[0]?.id || null;
+
     const insertHistorySQL = `
       INSERT INTO public.image_history
         (image_id, path, created_at, annotation, location, label)
       VALUES ($1, $2, $3, $4, $5, $6)
     `;
+
     await pool.query(insertHistorySQL, [
       imageId,
       localPath,
       date ? new Date(date) : new Date(),
-      annotation,
-      location,
+      annotation || null,
+      location || null,
       pythonLabel
     ]);
-  } catch (err) {
-    console.error('[ /upload ] DB insert error:', err);
-    // Do not fail the request if DB insert fails
+  } catch (error) {
+    console.error("[/upload] DB insert error:", error);
   }
 
-  res.json({
-    success:  true,
+  return res.json({
+    success: true,
     imageUrl: localPath,
-    label:    pythonLabel,
+    label: pythonLabel,
     features: pyFeat
   });
 });
 
-// GET /history → latest 100 images
-app.get('/history', async (req, res) => {
+app.get("/history", async (req, res) => {
   try {
     const result = await pool.query(`
       SELECT h.path, h.created_at, h.annotation, h.location, h.label
@@ -228,93 +294,113 @@ app.get('/history', async (req, res) => {
       ORDER BY h.created_at DESC
       LIMIT 100
     `);
-    res.json(result.rows);
-  } catch (err) {
-    console.error('[/history] DB error:', err);
-    res.status(500).json({ success: false, error: 'Erreur de lecture de la base' });
+
+    return res.json(result.rows);
+  } catch (error) {
+    console.error("[/history] DB error:", error);
+    return res.status(500).json({
+      success: false,
+      error: "Erreur de lecture de la base"
+    });
   }
 });
 
-
-// Middleware: vérifie le JWT présent dans l'en‑tête Authorization: Bearer <token>
-function auth(req, res, next) {
-  const authHeader = req.headers['authorization'] || '';
-  const token = authHeader.split(' ')[1]; // "Bearer <token>"
-  if (!token) {
-    return res.status(401).json({ success: false, error: 'Token manquant' });
-  }
-  try {
-    const payload = jwt.verify(token, JWT_SECRET);
-    req.user = payload; // { userId, email, prenom, nom, iat, exp }
-    next();
-  } catch (err) {
-    return res.status(401).json({ success: false, error: 'Token invalide' });
-  }
-}
-
-
-app.get('/me/city', auth, async (req, res) => {
+app.get("/me/city", auth, async (req, res) => {
   try {
     const result = await pool.query(
-      'SELECT ville FROM public.utilisateur WHERE id = $1',
+      "SELECT ville FROM public.utilisateur WHERE id = $1",
       [req.user.userId]
     );
-    const ville = result.rows[0]?.ville || null;   // "null" si non renseigné
-    res.json({ success: true, ville });
-  } catch (err) {
-    console.error('[/me/city] error:', err);
-    res.status(500).json({ success: false, error: 'Erreur serveur' });
+
+    const ville = result.rows[0]?.ville || null;
+
+    return res.json({
+      success: true,
+      ville
+    });
+  } catch (error) {
+    console.error("[/me/city] error:", error);
+    return res.status(500).json({
+      success: false,
+      error: "Erreur serveur"
+    });
   }
 });
 
-app.get('/api/seuils', async (req, res) => {
+app.get("/api/seuils", async (req, res) => {
   try {
-    const flaskRes = await fetch(`${FLASK_URL}/api/seuils`);
-    const json = await flaskRes.json();
-    res.json(json);
-  } catch (e) {
-    console.error('[Proxy] Erreur proxy seuils :', e);
-    res.status(500).json({ error: 'Erreur proxy seuils' });
+    const pythonRes = await fetch(`${PYTHON_API_URL}/api/seuils`);
+
+    if (!pythonRes.ok) {
+      throw new Error(`Python API responded ${pythonRes.status}`);
+    }
+
+    const json = await pythonRes.json();
+    return res.json(json);
+  } catch (error) {
+    console.error("[/api/seuils] proxy error:", error);
+    return res.status(500).json({
+      success: false,
+      error: "Erreur proxy seuils"
+    });
   }
 });
-app.post('/api/seuils/reset', async (req, res) => {
+
+app.post("/api/seuils/reset", async (req, res) => {
   try {
-    const flaskRes = await fetch(`${FLASK_URL}/api/seuils/reset`, { method: 'POST' });
-    const json = await flaskRes.json();
-    res.json(json);
-  } catch (e) {
-    console.error('[Proxy] Erreur proxy seuils reset :', e);
-    res.status(500).json({ error: 'Erreur proxy seuils reset' });
+    const pythonRes = await fetch(`${PYTHON_API_URL}/api/seuils/reset`, {
+      method: "POST"
+    });
+
+    if (!pythonRes.ok) {
+      throw new Error(`Python API responded ${pythonRes.status}`);
+    }
+
+    const json = await pythonRes.json();
+    return res.json(json);
+  } catch (error) {
+    console.error("[/api/seuils/reset] proxy error:", error);
+    return res.status(500).json({
+      success: false,
+      error: "Erreur proxy seuils reset"
+    });
   }
 });
-app.get('/history/by-city', auth, async (req, res) => {
+
+app.get("/history/by-city", auth, async (req, res) => {
   try {
-    //-- retrouver la ville de l’utilisateur
     const { rows } = await pool.query(
-      'SELECT ville FROM public.utilisateur WHERE id=$1', [req.user.userId]
+      "SELECT ville FROM public.utilisateur WHERE id = $1",
+      [req.user.userId]
     );
-    const ville = rows[0]?.ville || '';
-    if (!ville) return res.json([]);        // pas de ville → pas de données
 
-    //-- récupérer l’historique correspondant
-    const q = `
+    const ville = rows[0]?.ville || "";
+
+    if (!ville) {
+      return res.json([]);
+    }
+
+    const hist = await pool.query(
+      `
       SELECT h.path, h.created_at, h.annotation, h.location, h.label
-      FROM   public.image_history h
-      WHERE  LOWER(h.location) LIKE LOWER($1)      -- filtre ville
-      ORDER  BY h.created_at DESC
-      LIMIT  100
-    `;
-    const hist = await pool.query(q, [`%${ville}%`]);
-    res.json(hist.rows);
+      FROM public.image_history h
+      WHERE LOWER(h.location) LIKE LOWER($1)
+      ORDER BY h.created_at DESC
+      LIMIT 100
+      `,
+      [`%${ville}%`]
+    );
 
-  } catch (err) {
-    console.error('[/history/by-city] error:', err);
-    res.status(500).json({ success:false, error:'Erreur serveur' });
+    return res.json(hist.rows);
+  } catch (error) {
+    console.error("[/history/by-city] error:", error);
+    return res.status(500).json({
+      success: false,
+      error: "Erreur serveur"
+    });
   }
 });
 
-// ── START SERVER ─────────────────────────────────────────────────
-app.listen(PORT, () =>
-  console.log(`Server running on http://localhost:${PORT}`)
-);
-// ------------------------------------------------------------------
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`BinWatch API running on port ${PORT}`);
+});
