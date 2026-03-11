@@ -57,7 +57,7 @@ app.use(
   })
 );
 
-app.options("*", cors());
+app.options(/.*/, cors());
 
 app.use("/uploads", express.static(UPLOADS_DIR));
 app.use(express.urlencoded({ extended: true }));
